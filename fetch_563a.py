@@ -1,14 +1,15 @@
 """
-563A の株価を Yahoo!ファイナンスのページから取得できるかを確認するためのテストスクリプト。
+563A の株価を Yahoo!ファイナンスのページから取得できるかを確認するためのテストスクリプト(v2)。
 GitHub Actions 上で手動実行して、単純な HTTP GET + パースで価格が取れるかどうかを確認する。
 本番アプリ(gorokusan-tracker)には一切触れない、完全に独立した検証用コード。
+
+v1では __NEXT_DATA__ / 単純な正規表現で見つからなかったため、
+Next.js の RSC ストリーミング(self.__next_f.push(...))も含めて広く探すように変更。
 """
-import json
 import re
 import sys
 
 import requests
-from bs4 import BeautifulSoup
 
 URL = "https://finance.yahoo.co.jp/quote/563A.T"
 HEADERS = {
@@ -19,81 +20,60 @@ HEADERS = {
 }
 
 
-def try_next_data(soup):
-    """Next.js の __NEXT_DATA__ script タグから価格らしき数値を探す。"""
-    tag = soup.find("script", id="__NEXT_DATA__")
-    if not tag or not tag.string:
-        return None
-    try:
-        data = json.loads(tag.string)
-    except json.JSONDecodeError:
-        return None
-
-    # price / regularMarketPrice っぽいキーを再帰的に探す
-    candidates = []
-
-    def walk(node):
-        if isinstance(node, dict):
-            for k, v in node.items():
-                if isinstance(v, (int, float)) and re.search(
-                    r"price|Price", k
-                ):
-                    candidates.append((k, v))
-                walk(v)
-        elif isinstance(node, list):
-            for item in node:
-                walk(item)
-
-    walk(data)
-    return candidates or None
-
-
-def try_regex_fallback(html):
-    """HTML 全文から「現在値」付近の数値を正規表現で拾う簡易フォールバック。"""
-    m = re.search(r"現在値[^0-9]{0,20}([0-9,]+\.?[0-9]*)", html)
-    if m:
-        return m.group(1)
-    # メタタグ等に埋め込まれているケース
-    m = re.search(r'"regularMarketPrice"\s*:\s*"?([0-9,.]+)"?', html)
-    if m:
-        return m.group(1)
-    return None
+def find_keyword_context(html, keyword, radius=200, max_hits=5):
+    hits = []
+    start = 0
+    while True:
+        idx = html.find(keyword, start)
+        if idx == -1:
+            break
+        s = max(0, idx - radius)
+        e = min(len(html), idx + len(keyword) + radius)
+        hits.append(html[s:e])
+        start = idx + len(keyword)
+        if len(hits) >= max_hits:
+            break
+    return hits
 
 
 def main():
     resp = requests.get(URL, headers=HEADERS, timeout=15)
+    html = resp.text
     print(f"HTTPステータス: {resp.status_code}")
-    print(f"取得バイト数: {len(resp.text)}")
+    print(f"取得バイト数: {len(html)}")
 
     if resp.status_code != 200:
         print("NG: ページ取得自体に失敗しました。")
         sys.exit(1)
 
-    soup = BeautifulSoup(resp.text, "html.parser")
+    # 通常の「現在値」表記
+    found_any = False
+    for kw in ["現在値", "regularMarketPrice", "\\u73fe\\u5728\\u5024"]:
+        hits = find_keyword_context(html, kw)
+        if hits:
+            found_any = True
+            print(f"\n=== キーワード「{kw}」がヒット({len(hits)}件、うち最大5件表示) ===")
+            for i, h in enumerate(hits):
+                print(f"--- hit {i+1} ---")
+                print(h)
 
-    result = try_next_data(soup)
-    if result:
-        print("=== __NEXT_DATA__ から見つかった price 系フィールド ===")
-        for k, v in result[:20]:
-            print(f"  {k}: {v}")
-    else:
-        print("__NEXT_DATA__ からは見つかりませんでした。")
+    # 563A自体の名称やティッカーの近く数百文字も見ておく(構造把握用)
+    for kw in ["563A", "GX ＮＡＳＤＡＱ", "カバード・コール"]:
+        hits = find_keyword_context(html, kw, radius=150, max_hits=2)
+        if hits:
+            print(f"\n=== キーワード「{kw}」の周辺 ===")
+            for h in hits:
+                print(h)
 
-    fallback = try_regex_fallback(resp.text)
-    if fallback:
-        print(f"=== 正規表現フォールバックで見つかった値: {fallback} ===")
-    else:
-        print("正規表現フォールバックでも見つかりませんでした。")
-
-    if not result and not fallback:
-        print("\nNG: どちらの方法でも価格が見つかりませんでした。")
-        print("ページ冒頭2000文字を出力します(構造確認用):\n")
-        print(resp.text[:2000])
+    if not found_any:
+        print("\nNG: 価格らしきキーワードが見つかりませんでした。")
+        print("ページの主要部分がクライアント側JS実行後にしか現れない可能性があります。")
         sys.exit(1)
 
-    print("\n判定: 少なくとも一部の方法で価格らしき値が取得できました。")
-    print("上のログの数値が実際の563Aの株価と一致するか、目視で確認してください。")
+    print("\n上のヒット内容に実際の株価の数値が含まれているか、目視で確認してください。")
 
 
+if __name__ == "__main__":
+    main()
 if __name__ == "__main__":
     main()
